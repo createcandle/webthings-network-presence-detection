@@ -60,12 +60,18 @@ class PresenceAdapter(Adapter):
         self.selected_interface = "eth0"
         
         self.busy_doing_arpa_scan = False
+        self.devices_excluding_arping = ""
         
         self.use_brute_force_scan = False; # was used for continuous brute force scanning. This has been deprecated.
         self.should_brute_force_scan = True
         self.busy_doing_brute_force_scan = False
         self.last_brute_force_scan_time = 0             # Allows the add-on to start a brute force scan right away.
         self.seconds_between_brute_force_scans = 1800  #1800  # 30 minutes     
+
+        # AVAHI
+        self.last_avahi_scan_time = 0
+        self.avahi_lookup_table = {}
+        
         
         self.running = True
         self.saved_devices = []
@@ -116,6 +122,7 @@ class PresenceAdapter(Adapter):
         if not self.DEBUG:
             time.sleep(5) # give it a few more seconds to make sure the network is up
            
+        self.selected_interface = "wlan0"
         self.select_interface() # checks if the preference is possible.
         
         if self.DEBUG:
@@ -228,6 +235,13 @@ class PresenceAdapter(Adapter):
             # Should brute force scans be attempted?
             if 'Use brute force scanning' in config:
                 self.use_brute_force = bool(config['Use brute force scanning'])
+
+            if 'Addresses to not arping' in config:
+                try:
+                    self.devices_excluding_arping = str(config['Devices excluding arping'])  
+                    print("Devices excluding ARPing from settings: " + str(self.devices_excluding_arping))
+                except:
+                    print("No addresses to not arping were found in the settings.")
 
         except Exception as ex:
             print("Error getting config data from database. Check the add-on's settings page for any issues. Error: " + str(ex))
@@ -490,7 +504,8 @@ class PresenceAdapter(Adapter):
                                     if self.DEBUG:
                                         print(">> Ping could not find " + str(self.previously_found[key]['name']) + " at " + str(self.previously_found[key]['ip']) + ". Maybe Arping can.")
                                     try:
-                                        if self.arping(self.previously_found[key]['ip'], 1) == 0:
+                                        
+                                        if not self.previously_found[key]['ip'] in self.devices_excluding_arping and not self.previously_found[key]['mac_address'] in self.devices_excluding_arping and self.arping(self.previously_found[key]['ip'], 1) == 0:
                                             self.previously_found[key]['lastseen'] = int(time.time())
                                             if self.DEBUG:
                                                 print(">> Arping found it.")
@@ -845,6 +860,65 @@ class PresenceAdapter(Adapter):
 
     def get_optimal_name(self,ip_address,found_device_name="unnamed",mac_address=""):
 
+
+        if self.last_avahi_scan_time < (time.time() - 3600):
+            if self.DEBUG:
+                print("getting fresh avahi data, it's been at least an hour")
+            
+            command = ["avahi-browse","-p","-l","-a","-r","-k","-t"]
+            gateway_list = []
+            satellite_targets = {}
+            try:
+            
+                result = subprocess.run(command, universal_newlines=True, stdout=subprocess.PIPE) #.decode())
+                for line in result.stdout.split('\n'):
+            
+                    if  "IPv4;CandleMQTT-" in line:
+                        if self.DEBUG:
+                            print(str(line))
+                        # get name
+                        try:
+                            before = 'IPv4;CandleMQTT-'
+                            after = ';_mqtt._tcp;'
+                            name = line[line.find(before)+16 : line.find(after)]
+                        except Exception as ex:
+                            #print("invalid name: " + str(ex))
+                            continue
+                        
+                        # get IP
+                        #pattern = re.compile(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})')
+                        #ip = pattern.search(line)[0]
+                        #lst.append(pattern.search(line)[0])
+                        
+                        try:
+                            ip_address_list = re.findall(r'(?:\d{1,3}\.)+(?:\d{1,3})', str(line))
+                            if self.DEBUG:
+                                print("ip_address_list = " + str(ip_address_list))
+                            if len(ip_address_list) > 0:
+                                ip_address = str(ip_address_list[0])
+                                if not valid_ip(ip_address):
+                                    continue
+                
+                                if ip_address not in gateway_list:
+                                    gateway_list.append(ip_address)
+                                    satellite_targets[ip_address] = name
+                                    
+                        except Exception as ex:
+                            if self.DEBUG:
+                                print("no IP address in line: " + str(ex))
+                
+                self.avahi_lookup_table = satellite_targets
+           
+            
+            except Exception as ex:
+                print("Arp -a error: " + str(ex))
+            
+                
+                
+                
+            
+            
+
         # Try to get hostname
         nmb_result = ""
         
@@ -893,28 +967,33 @@ class PresenceAdapter(Adapter):
         if nmb_result == "":
             #if self.DEBUG:
             #    print("NMB lookup result was an empty string")
+            
+            if ip_address in self.avahi_lookup_table:
                 
-            # Round 2: analyse MAC address
-            if found_device_name == '?' or found_device_name == '' or valid_ip(found_device_name):
-                if self.DEBUG: 
-                    print("Will try to figure out a vendor name based on the mac address")
-                vendor = ip_address
-                try:
-                    # Get the vendor name, and shorten it. It removes
-                    # everything after the comma. Thus "Apple, inc"
-                    # becomes "Apple"
-                    vendor = get_vendor(mac_address)
-                    if self.DEBUG:
-                        print("get_vendor mac lookup result: " + str(vendor))
-                    if vendor is not None:
-                        vendor = vendor.split(' ', 1)[0]
-                        vendor = vendor.split(',', 1)[0]
-                    else:
-                        vendor = ip_address
-                except ValueError:
-                    pass
+                found_device_name = str(self.avahi_lookup_table[ip_address]) # + ' (' + str(ip_address) + ')'
+            
+            else:
+                # Round 2: analyse MAC address
+                if found_device_name == '?' or found_device_name == '' or valid_ip(found_device_name):
+                    if self.DEBUG: 
+                        print("Will try to figure out a vendor name based on the mac address")
+                    vendor = ip_address
+                    try:
+                        # Get the vendor name, and shorten it. It removes
+                        # everything after the comma. Thus "Apple, inc"
+                        # becomes "Apple"
+                        vendor = get_vendor(mac_address)
+                        if self.DEBUG:
+                            print("get_vendor mac lookup result: " + str(vendor))
+                        if vendor is not None:
+                            vendor = vendor.split(' ', 1)[0]
+                            vendor = vendor.split(',', 1)[0]
+                        else:
+                            vendor = ip_address
+                    except ValueError:
+                        pass
 
-                found_device_name = vendor
+                    found_device_name = vendor
                 
         else:
             found_device_name = nmb_result
@@ -948,17 +1027,17 @@ class PresenceAdapter(Adapter):
                 could_be_same_same = False
                 try:
                     for key in self.previously_found:
-                        if self.DEBUG:
-                            print("-checking possible name '" + str(possible_name) + "' against: " + str(self.previously_found[key]['name']))
-                            print("--prev found device key = " + str(key))
+                        #if self.DEBUG:
+                        #    print("-checking possible name '" + str(possible_name) + "' against: " + str(self.previously_found[key]['name']))
+                        #    print("--prev found device key = " + str(key))
                         
                         # We skip checking for name duplication if the potential new device is the exact same device, so it would be logical if they had the same name.
                         if str(key) == str(_id):
-                            if self.DEBUG:
-                                print("key == _id")
+                            #if self.DEBUG:
+                            #    print("key == _id")
                             if possible_name == str(self.previously_found[key]['name']):
-                                if self.DEBUG:
-                                    print("the new name is the same as the old for this mac-address")
+                                #if self.DEBUG:
+                                #    print("the new name is the same as the old for this mac-address")
                                 #continue
                                 break
                         
@@ -966,16 +1045,19 @@ class PresenceAdapter(Adapter):
                             could_be_same_same = True
                             if self.DEBUG:
                                 print("-names collided: " + str(possible_name))
-                            possible_name = found_device_name + "  (" + str(ip_address) + ")"
-                            if self.DEBUG:
-                                print("-now testing new name: " + str(possible_name))
+                            possible_name = found_device_name + " " + str(i) + "  (" + str(ip_address) + ")"
+                            #if self.DEBUG:
+                            #    print("-now testing new name: " + str(possible_name))
                             i += 1 # up the count for a potential next round
-                            if i > 200:
-                                if self.DEBUG:
-                                    print("Reached 200 limit in while loop") # if the user has 200 of the same device, that's incredible.
+                            if i > 20:
+                                #if self.DEBUG:
+                                #    print("Reached 200 limit in while loop") # if the user has 200 of the same device, that's incredible.
                                 break
+                                
                 except Exception as ex:
                     print("Error doing name check in while loop: " + str(ex))
+                    break
+                    
         except Exception as ex:
             print("Error in name duplicate check: " + str(ex))
         
@@ -1251,7 +1333,8 @@ class PresenceAdapter(Adapter):
             
             except Exception as ex:
                 print("arpa: error while doing ip neighbour scan: " + str(ex))
-        
+            
+            
             self.busy_doing_arpa_scan = False
                 
         else:
@@ -1264,15 +1347,19 @@ class PresenceAdapter(Adapter):
 
 
     def select_interface(self):
-        eth0_output = subprocess.check_output(['ifconfig', 'eth0']).decode('utf-8')
-        #print("eth0_output = " + str(eth0_output))
-        wlan0_output = subprocess.check_output(['ifconfig', 'wlan0']).decode('utf-8')
-        #print("wlan0_output = " + str(wlan0_output))
-        if "inet " in eth0_output and self.prefered_interface == "eth0":
-            self.selected_interface = "eth0"
-        if not "inet " in eth0_output and self.prefered_interface == "eth0":
-            self.selected_interface = "wlan0"
-        if "inet " in wlan0_output and self.prefered_interface == "wlan0":
+        try:
+            eth0_output = subprocess.check_output(['ifconfig', 'eth0']).decode('utf-8')
+            #print("eth0_output = " + str(eth0_output))
+            wlan0_output = subprocess.check_output(['ifconfig', 'wlan0']).decode('utf-8')
+            #print("wlan0_output = " + str(wlan0_output))
+            if "inet " in eth0_output and self.prefered_interface == "eth0":
+                self.selected_interface = "eth0"
+            if not "inet " in eth0_output and self.prefered_interface == "eth0":
+                self.selected_interface = "wlan0"
+            if "inet " in wlan0_output and self.prefered_interface == "wlan0":
+                self.selected_interface = "wlan0"
+        except Exception as ex:
+            print("Error in select_interface: " + str(ex))
             self.selected_interface = "wlan0"
         
             
